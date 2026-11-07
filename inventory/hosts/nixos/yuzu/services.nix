@@ -43,7 +43,7 @@
   networking.firewall.allowedTCPPorts = [ 38443 ];
 
   infra.dnsctl = {
-    ipv4 = "38.246.237.114";
+    ipv4 = "38.246.237.110";
     domain = "pippaye.top";
     nginxVirtualHosts = {
       "magpie-web.yuzu" = {

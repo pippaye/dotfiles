@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A single-file package manager for programs published in GitHub Releases."""
+"""A delightfully impure package manager for GitHub Releases. Grab binaries with pure side effects."""
 
 from __future__ import annotations
 
@@ -12,14 +12,17 @@ import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -31,27 +34,27 @@ except ImportError:  # pragma: no cover - Windows has no fcntl.
     fcntl = None
 
 
-class GhpmError(Exception):
+class ImpureError(Exception):
     """Base class for expected errors."""
 
 
-class ConfigError(GhpmError):
+class ConfigError(ImpureError):
     """An invalid package or manifest definition."""
 
 
-class StateError(GhpmError):
+class StateError(ImpureError):
     """A missing or corrupt local state file."""
 
 
-class ReleaseError(GhpmError):
+class ReleaseError(ImpureError):
     """A GitHub API or download failure."""
 
 
-class AssetError(GhpmError):
+class AssetError(ImpureError):
     """No unambiguous release asset was found."""
 
 
-class ChecksumError(GhpmError):
+class ChecksumError(ImpureError):
     """A downloaded asset failed SHA-256 verification."""
 
 
@@ -75,47 +78,81 @@ def _repo(value: Any) -> str:
     return value
 
 
+def _libc(value: Any) -> str:
+    value = _string(value, "libc").lower()
+    if value not in {"gnu", "musl"}:
+        raise ConfigError("libc must be either 'gnu' or 'musl'")
+    return value
+
+
 @dataclass(frozen=True)
 class PackageSpec:
     """Declarative description of one script-driven GitHub Release package."""
 
     name: str
     repo: str
-    asset_pattern: str
-    install_script: str
-    uninstall_script: str
+    asset_pattern: str | None = None
+    install_script: str | None = None
+    uninstall_script: str | None = None
     version: str = "latest"
+    libc: str = "musl"
     checksum_asset_pattern: str | None = None
+    checksum_asset_suffix: str | None = None
     checksum_required: bool = False
 
     def __post_init__(self) -> None:
         name = _package_name(self.name)
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "repo", _repo(self.repo))
-        object.__setattr__(
-            self, "asset_pattern", _string(self.asset_pattern, "asset_pattern")
-        )
-        object.__setattr__(
-            self, "install_script", _string(self.install_script, "install_script")
-        )
-        object.__setattr__(
-            self, "uninstall_script", _string(self.uninstall_script, "uninstall_script")
-        )
+        if self.asset_pattern is not None:
+            object.__setattr__(
+                self, "asset_pattern", _string(self.asset_pattern, "asset_pattern")
+            )
+        if self.install_script is not None:
+            object.__setattr__(
+                self, "install_script", _string(self.install_script, "install_script")
+            )
+        if self.uninstall_script is not None:
+            object.__setattr__(
+                self, "uninstall_script", _string(self.uninstall_script, "uninstall_script")
+            )
         object.__setattr__(self, "version", _string(self.version, "version"))
+        object.__setattr__(self, "libc", _libc(self.libc))
         if self.checksum_asset_pattern is not None:
             object.__setattr__(
                 self,
                 "checksum_asset_pattern",
                 _string(self.checksum_asset_pattern, "checksum.asset_pattern"),
             )
+        if self.checksum_asset_suffix is not None:
+            object.__setattr__(
+                self,
+                "checksum_asset_suffix",
+                _string(self.checksum_asset_suffix, "checksum.suffix"),
+            )
+        if (
+            self.checksum_asset_pattern is not None
+            and self.checksum_asset_suffix is not None
+        ):
+            raise ConfigError(
+                "checksum.asset_pattern and checksum.suffix are mutually exclusive"
+            )
         if not isinstance(self.checksum_required, bool):
             raise ConfigError("checksum.required must be boolean")
-        if self.checksum_required and self.checksum_asset_pattern is None:
-            raise ConfigError("checksum.required requires checksum.asset_pattern")
+        if self.checksum_required and (
+            self.checksum_asset_pattern is None and self.checksum_asset_suffix is None
+        ):
+            raise ConfigError(
+                "checksum.required requires checksum.asset_pattern or checksum.suffix"
+            )
 
     @classmethod
     def from_dict(
-        cls, value: Mapping[str, Any], name: str | None = None
+        cls,
+        value: Mapping[str, Any],
+        name: str | None = None,
+        *,
+        default_libc: str = "musl",
     ) -> PackageSpec:
         if not isinstance(value, Mapping):
             raise ConfigError("each package must be an object")
@@ -133,6 +170,7 @@ class PackageSpec:
             "install_script",
             "uninstall_script",
             "version",
+            "libc",
             "checksum",
         }
         unknown = sorted(set(value) - allowed)
@@ -145,7 +183,9 @@ class PackageSpec:
             checksum = {}
         if not isinstance(checksum, Mapping):
             raise ConfigError("checksum must be a TOML table")
-        unknown_checksum = sorted(set(checksum) - {"asset_pattern", "required"})
+        unknown_checksum = sorted(
+            set(checksum) - {"asset_pattern", "suffix", "required"}
+        )
         if unknown_checksum:
             raise ConfigError("unknown checksum fields: " + ", ".join(unknown_checksum))
         return cls(
@@ -155,7 +195,9 @@ class PackageSpec:
             install_script=value.get("install_script"),
             uninstall_script=value.get("uninstall_script"),
             version=value.get("version", "latest"),
+            libc=value.get("libc", default_libc),
             checksum_asset_pattern=checksum.get("asset_pattern"),
+            checksum_asset_suffix=checksum.get("suffix"),
             checksum_required=checksum.get("required", False),
         )
 
@@ -170,10 +212,13 @@ class PackageSpec:
             "install_script": self.install_script,
             "uninstall_script": self.uninstall_script,
             "version": self.version,
+            "libc": self.libc,
         }
         checksum: dict[str, Any] = {}
         if self.checksum_asset_pattern:
             checksum["asset_pattern"] = self.checksum_asset_pattern
+        if self.checksum_asset_suffix:
+            checksum["suffix"] = self.checksum_asset_suffix
         if self.checksum_required:
             checksum["required"] = True
         if checksum:
@@ -182,13 +227,113 @@ class PackageSpec:
 
 
 @dataclass(frozen=True)
+class Config:
+    bin_dir: Path | None = None
+    libc: str = "musl"
+    recipes: Mapping[str, PackageSpec] = field(default_factory=dict)
+
+    @classmethod
+    def default_path(cls) -> Path:
+        configured = os.environ.get("IMPURE_CONFIG") or os.environ.get("IMPURE_CONFIG")
+        if configured:
+            return _path(configured, Path.cwd() / "config.toml")
+        root = os.environ.get("XDG_CONFIG_HOME")
+        impure_dir = Path(root) / "impure" if root else Path.home() / ".config" / "impure"
+        if (impure_dir / "config.toml").exists():
+            return (impure_dir / "config.toml").absolute()
+        return _path(None, impure_dir / "config.toml")
+
+    @classmethod
+    def load(cls, path: str | os.PathLike[str] | None = None) -> Config:
+        config_path = Path(
+            os.path.expandvars(os.path.expanduser(os.fspath(path)))
+        ) if path is not None else cls.default_path()
+        if not config_path.exists():
+            return cls()
+        try:
+            with config_path.open("rb") as stream:
+                doc = tomllib.load(stream)
+        except Exception:
+            return cls()
+        if not isinstance(doc, Mapping):
+            return cls()
+        libc = _libc(doc.get("libc", "musl"))
+        bin_dir = doc.get("bin_dir")
+        if bin_dir is not None:
+            bin_dir = Path(
+                os.path.expandvars(os.path.expanduser(_string(bin_dir, "bin_dir")))
+            )
+        raw_recipes = doc.get("recipes", {})
+        recipes: dict[str, PackageSpec] = {}
+        if isinstance(raw_recipes, Mapping):
+            for r_key, r_val in raw_recipes.items():
+                if isinstance(r_val, Mapping):
+                    spec = PackageSpec.from_dict(
+                        dict(r_val), name=str(r_key), default_libc=libc
+                    )
+                    recipes[spec.name] = spec
+        return cls(bin_dir=bin_dir, libc=libc, recipes=recipes)
+
+
+@dataclass(frozen=True)
 class Manifest:
     packages: Mapping[str, PackageSpec]
     bin_dir: Path | None = None
+    libc: str = "musl"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "libc", _libc(self.libc))
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str]) -> Manifest:
+    def load(
+        cls,
+        path: str | os.PathLike[str],
+        config: Config | None = None,
+    ) -> Manifest:
         manifest_path = Path(os.path.expandvars(os.path.expanduser(os.fspath(path))))
+        cfg = config or Config.load()
+
+        if manifest_path.suffix.lower() == ".txt":
+            try:
+                text_content = manifest_path.read_text(encoding="utf-8")
+            except FileNotFoundError as exc:
+                raise ConfigError(f"manifest not found: {manifest_path}") from exc
+            except OSError as exc:
+                raise ConfigError(
+                    f"could not read manifest {manifest_path}: {exc}"
+                ) from exc
+
+            recipes: dict[str, Any] = {
+                name: spec.to_dict() for name, spec in cfg.recipes.items()
+            }
+            packages: dict[str, PackageSpec] = {}
+
+            for line in text_content.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                entry = line.split("#", 1)[0].strip()
+                if not entry:
+                    continue
+                name, version, repo = parse_package_ref(entry)
+                recipe_data = recipes.get(name, {})
+                combined = {
+                    "name": name,
+                    "repo": repo or recipe_data.get("repo", name),
+                    "version": version or recipe_data.get("version", "latest"),
+                    "libc": recipe_data.get("libc", cfg.libc),
+                    "asset_pattern": recipe_data.get("asset_pattern"),
+                    "install_script": recipe_data.get("install_script"),
+                    "uninstall_script": recipe_data.get("uninstall_script"),
+                }
+                if "checksum" in recipe_data:
+                    combined["checksum"] = recipe_data["checksum"]
+                packages[name] = PackageSpec.from_dict(
+                    combined, name=name, default_libc=cfg.libc
+                )
+
+            return cls(packages=packages, bin_dir=cfg.bin_dir, libc=cfg.libc)
+
         try:
             with manifest_path.open("rb") as stream:
                 document = tomllib.load(stream)
@@ -204,32 +349,102 @@ class Manifest:
             ) from exc
         if not isinstance(document, Mapping):
             raise ConfigError("manifest root must be an object")
-        unknown = sorted(set(document) - {"version", "bin_dir", "packages"})
+        unknown = sorted(
+            set(document) - {"version", "bin_dir", "libc", "packages", "recipes"}
+        )
         if unknown:
             raise ConfigError("unknown manifest fields: " + ", ".join(unknown))
-        if "version" not in document:
-            raise ConfigError("manifest is missing required field: version")
-        manifest_version = document["version"]
+
+        manifest_version = document.get("version", 1)
         if isinstance(manifest_version, bool) or manifest_version != 1:
             raise ConfigError("unsupported manifest version; expected 1")
+
+        manifest_libc = _libc(document.get("libc", cfg.libc))
+
+        # 合并来自 Config 的全局 recipes 以及 manifest 内联 recipes (如有)
+        recipes = {
+            name: spec.to_dict() for name, spec in cfg.recipes.items()
+        }
+        raw_inline_recipes = document.get("recipes", {})
+        if isinstance(raw_inline_recipes, Mapping):
+            for r_k, r_v in raw_inline_recipes.items():
+                if isinstance(r_v, Mapping):
+                    recipes[str(r_k)] = dict(r_v)
+
         raw_packages = document.get("packages", {})
-        if not isinstance(raw_packages, Mapping):
-            raise ConfigError(
-                "manifest packages must be a TOML table keyed by package name"
-            )
-        items = ((str(key), value) for key, value in raw_packages.items())
-        packages: dict[str, PackageSpec] = {}
-        for key, value in items:
-            spec = PackageSpec.from_dict(value, name=key)
-            if spec.name in packages:
-                raise ConfigError(f"duplicate package name: {spec.name}")
-            packages[spec.name] = spec
+        packages = {}
+
+        if isinstance(raw_packages, Sequence) and not isinstance(
+            raw_packages, (str, bytes)
+        ):
+            for item in raw_packages:
+                if not isinstance(item, str):
+                    continue
+                name, version, repo = parse_package_ref(item)
+                recipe_data = recipes.get(name, {})
+                combined = {
+                    "name": name,
+                    "repo": repo or recipe_data.get("repo", name),
+                    "version": version or recipe_data.get("version", "latest"),
+                    "libc": recipe_data.get("libc", manifest_libc),
+                    "asset_pattern": recipe_data.get("asset_pattern"),
+                    "install_script": recipe_data.get("install_script"),
+                    "uninstall_script": recipe_data.get("uninstall_script"),
+                }
+                if "checksum" in recipe_data:
+                    combined["checksum"] = recipe_data["checksum"]
+                packages[name] = PackageSpec.from_dict(
+                    combined, name=name, default_libc=manifest_libc
+                )
+        elif isinstance(raw_packages, Mapping):
+            for key, value in raw_packages.items():
+                str_key = str(key)
+                if isinstance(value, str):
+                    name, version, repo = parse_package_ref(value)
+                    recipe_data = recipes.get(str_key, {})
+                    combined = {
+                        "name": str_key,
+                        "repo": repo or (value if "/" in value else recipe_data.get("repo")),
+                        "version": version or recipe_data.get("version", "latest"),
+                        "libc": recipe_data.get("libc", manifest_libc),
+                        "asset_pattern": recipe_data.get("asset_pattern"),
+                        "install_script": recipe_data.get("install_script"),
+                        "uninstall_script": recipe_data.get("uninstall_script"),
+                    }
+                    if "checksum" in recipe_data:
+                        combined["checksum"] = recipe_data["checksum"]
+                    packages[str_key] = PackageSpec.from_dict(
+                        combined, name=str_key, default_libc=manifest_libc
+                    )
+                elif isinstance(value, Mapping):
+                    pkg_data = dict(value)
+                    if str_key in recipes:
+                        for r_k, r_v in recipes[str_key].items():
+                            pkg_data.setdefault(r_k, r_v)
+                    packages[str_key] = PackageSpec.from_dict(
+                        pkg_data, name=str_key, default_libc=manifest_libc
+                    )
+                else:
+                    raise ConfigError(
+                        f"invalid package definition for {str_key!r}"
+                    )
+        else:
+            raise ConfigError("packages must be a table or an array")
+
+        for r_name, r_spec_data in recipes.items():
+            if r_name not in packages and "repo" in r_spec_data:
+                packages[r_name] = PackageSpec.from_dict(
+                    r_spec_data, name=r_name, default_libc=manifest_libc
+                )
+
         bin_dir = document.get("bin_dir")
         if bin_dir is not None:
             bin_dir = Path(
                 os.path.expandvars(os.path.expanduser(_string(bin_dir, "bin_dir")))
             )
-        return cls(packages=packages, bin_dir=bin_dir)
+        elif cfg.bin_dir is not None:
+            bin_dir = cfg.bin_dir
+        return cls(packages=packages, bin_dir=bin_dir, libc=manifest_libc)
 
     def get(self, name: str) -> PackageSpec | None:
         return self.packages.get(name)
@@ -245,7 +460,7 @@ class Host:
         architecture = _string(self.arch, "host architecture").lower()
         if operating_system not in {"darwin", "linux"}:
             raise ConfigError(
-                f"unsupported host OS {operating_system!r}; supported targets are darwin-aarch64 and linux-amd64"
+                f"unsupported host OS {operating_system!r}; supported targets are darwin and linux"
             )
         architecture = {
             "amd64": "amd64",
@@ -255,11 +470,10 @@ class Host:
             "arm64": "aarch64",
             "armv8l": "aarch64",
         }.get(architecture, architecture)
-        expected = "aarch64" if operating_system == "darwin" else "amd64"
-        if architecture != expected:
+        if architecture not in {"amd64", "aarch64"}:
             raise ConfigError(
                 f"unsupported host target {operating_system}-{architecture}; "
-                "supported targets are darwin-aarch64 and linux-amd64"
+                "supported architectures are amd64 and aarch64"
             )
         object.__setattr__(self, "os", operating_system)
         object.__setattr__(self, "arch", architecture)
@@ -273,7 +487,7 @@ class Host:
             operating_system = "darwin"
         else:
             raise ConfigError(
-                f"unsupported host OS {system!r}; supported targets are darwin-aarch64 and linux-amd64"
+                f"unsupported host OS {system!r}; supported targets are darwin and linux"
             )
         machine = platform.machine().lower()
         arch = {
@@ -297,6 +511,67 @@ class Host:
             "amd64": ("amd64", "x86_64", "x64"),
             "aarch64": ("aarch64", "arm64", "armv8", "armv8l"),
         }.get(self.arch, (self.arch,))
+
+    def libc_aliases(self, libc: str = "musl") -> tuple[str, ...]:
+        libc = _libc(libc)
+        return ("gnu", "glibc") if libc == "gnu" else ("musl",)
+
+    def platform_aliases(self, libc: str = "musl") -> tuple[str, ...]:
+        """Common release target spellings for the host and selected Linux ABI."""
+        libc = _libc(libc)
+        if self.os == "darwin":
+            arch_tokens = (
+                ("aarch64", "arm64")
+                if self.arch == "aarch64"
+                else ("x86_64", "amd64", "x64")
+            )
+            aliases: list[str] = []
+            for at in arch_tokens:
+                aliases.extend(
+                    (
+                        f"{at}-apple-darwin",
+                        f"{at}-unknown-darwin",
+                        f"{at}-darwin",
+                        f"{at}-apple-macos",
+                        f"{at}-macos",
+                        f"{at}-osx",
+                        f"darwin-{at}",
+                        f"macos-{at}",
+                        f"osx-{at}",
+                    )
+                )
+            return tuple(aliases)
+
+        if self.os == "linux":
+            abi_aliases = self.libc_aliases(libc)
+            arch_tokens = (
+                ("aarch64", "arm64")
+                if self.arch == "aarch64"
+                else ("x86_64", "amd64", "x64")
+            )
+            aliases = []
+            for architecture in arch_tokens:
+                for vendor in ("unknown", "pc"):
+                    for abi in abi_aliases:
+                        aliases.append(f"{architecture}-{vendor}-linux-{abi}")
+                for abi in abi_aliases:
+                    aliases.extend(
+                        (
+                            f"{architecture}-linux-{abi}",
+                            f"linux-{architecture}-{abi}",
+                            f"linux-{abi}-{architecture}",
+                        )
+                    )
+                aliases.extend(
+                    (
+                        f"{architecture}-unknown-linux",
+                        f"{architecture}-linux",
+                        f"linux-{architecture}",
+                    )
+                )
+            return tuple(aliases)
+
+        return ()
 
 
 @dataclass(frozen=True)
@@ -343,6 +618,29 @@ class Release:
         return cls(repo, tag, str(value.get("name") or tag), tuple(assets))
 
 
+def _detect_github_token() -> str | None:
+    token = (
+        os.environ.get("IMPURE_TOKEN")
+        or os.environ.get("IMPURE_TOKEN")
+        or os.environ.get("GITHUB_TOKEN")
+    )
+    if token:
+        return token
+    try:
+        res = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 class GitHubClient:
     """Minimal GitHub Releases client with an injectable API base URL."""
 
@@ -351,12 +649,10 @@ class GitHubClient:
         api_url: str = "https://api.github.com",
         token: str | None = None,
         timeout: float = 30.0,
-        user_agent: str = "ghpm/1.0",
+        user_agent: str = "impure/1.0",
     ) -> None:
         self.api_url = _string(api_url, "api_url").rstrip("/")
-        self.token = (
-            token or os.environ.get("GHPM_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        )
+        self.token = token or _detect_github_token()
         self.timeout = timeout
         self.user_agent = user_agent
 
@@ -416,7 +712,7 @@ class GitHubClient:
             if not partial.is_file() or partial.stat().st_size == 0:
                 raise ReleaseError(f"downloaded asset is empty: {asset.name}")
             os.replace(partial, destination)
-        except GhpmError:
+        except ImpureError:
             partial.unlink(missing_ok=True)
             raise
         except OSError as exc:
@@ -438,6 +734,12 @@ def _pattern_values(spec: PackageSpec, tag: str, host: Host) -> dict[str, str]:
         + ")",
         "os": "(?:" + "|".join(re.escape(v) for v in host.os_aliases()) + ")",
         "arch": "(?:" + "|".join(re.escape(v) for v in host.arch_aliases()) + ")",
+        "libc": "(?:"
+        + "|".join(re.escape(v) for v in host.libc_aliases(spec.libc))
+        + ")",
+        "platform": "(?:"
+        + "|".join(re.escape(v) for v in host.platform_aliases(spec.libc))
+        + ")",
     }
 
 
@@ -453,28 +755,187 @@ def expand_pattern(pattern: str, spec: PackageSpec, tag: str, host: Host) -> str
     return re.sub(r"\{([A-Za-z][A-Za-z0-9_]*)\}", substitute, pattern)
 
 
+def _score_asset(name: str, host: Host, libc: str = "musl") -> int:
+    name_lower = name.lower()
+    if name_lower.endswith(
+        (
+            ".sha256",
+            ".sha256sum",
+            ".sha256sums",
+            ".sha512",
+            ".md5",
+            ".txt",
+            ".sig",
+            ".pem",
+            ".asc",
+            ".deb",
+            ".rpm",
+            ".msi",
+            ".exe",
+            ".pkg",
+            ".apk",
+        )
+    ):
+        return -100
+
+    other_os = []
+    if host.os != "darwin":
+        other_os.extend(["darwin", "macos", "osx", "apple"])
+    if host.os != "linux":
+        other_os.append("linux")
+    other_os.extend(["windows", "win32", "win64"])
+    if any(other in name_lower for other in other_os):
+        return -100
+
+    other_arch = []
+    if host.arch == "amd64":
+        other_arch.extend(
+            ["arm64", "aarch64", "armv7", "armv6", "i386", "386", "x86_32", "riscv"]
+        )
+    elif host.arch == "aarch64":
+        other_arch.extend(
+            ["amd64", "x86_64", "x64", "x86", "i386", "armv7", "armv6", "riscv"]
+        )
+    if any(other in name_lower for other in other_arch):
+        return -100
+
+    score = 0
+    if any(alias in name_lower for alias in host.os_aliases()):
+        score += 10
+    if any(alias in name_lower for alias in host.arch_aliases()):
+        score += 10
+
+    if host.os == "linux":
+        if libc == "musl" and "musl" in name_lower:
+            score += 2
+        elif libc == "gnu" and ("gnu" in name_lower or "glibc" in name_lower):
+            score += 2
+
+    if name_lower.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".zip")):
+        score += 5
+    elif "." not in Path(name).name:
+        score += 3
+
+    return score
+
+
+def _extract_binaries(
+    asset_path: Path, output_dir: Path, target_name: str
+) -> list[str]:
+    """Extract binaries from asset into output_dir and return list of installed filenames."""
+    installed = []
+    name_lower = asset_path.name.lower()
+    temp_extract = asset_path.parent / "extracted"
+    temp_extract.mkdir(parents=True, exist_ok=True)
+
+    if name_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".tar")):
+        with tarfile.open(asset_path, "r:*") as tar:
+            tar.extractall(path=temp_extract)
+    elif name_lower.endswith(".zip"):
+        with zipfile.ZipFile(asset_path, "r") as z:
+            z.extractall(path=temp_extract)
+    else:
+        target_file = output_dir / target_name
+        shutil.copy2(asset_path, target_file)
+        target_file.chmod(
+            target_file.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+        )
+        return [target_name]
+
+    candidates: list[Path] = []
+    for root, _, files in os.walk(temp_extract):
+        for f in files:
+            full_path = Path(root) / f
+            if f.lower().endswith(
+                (
+                    ".md",
+                    ".txt",
+                    ".pdf",
+                    ".html",
+                    ".json",
+                    ".yaml",
+                    ".yml",
+                    ".toml",
+                    ".png",
+                    ".svg",
+                    ".1",
+                )
+            ):
+                continue
+            candidates.append(full_path)
+
+    exact = [c for c in candidates if c.name == target_name]
+    execs = [
+        c for c in candidates if os.access(c, os.X_OK) and not c.name.startswith(".")
+    ]
+
+    selected: list[Path] = []
+    if exact:
+        selected = exact
+    elif execs:
+        fuzzy = [c for c in execs if target_name in c.name.lower()]
+        selected = fuzzy if fuzzy else execs
+    elif candidates:
+        fuzzy = [c for c in candidates if target_name in c.name.lower()]
+        selected = fuzzy if fuzzy else [candidates[0]]
+
+    for src in selected:
+        dst = output_dir / src.name
+        shutil.copy2(src, dst)
+        dst.chmod(dst.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        installed.append(dst.name)
+
+    return list(set(installed))
+
+
 def select_asset(
     release: Release, spec: PackageSpec, host: Host | None = None
 ) -> ReleaseAsset:
-    """Select the one asset declared by the package's regex."""
+    """Select the one asset declared by the package's regex or heuristically."""
     host = host or Host.current()
     if not release.assets:
         raise AssetError(f"release {release.repo}@{release.tag} has no assets")
-    try:
-        pattern = re.compile(
-            expand_pattern(spec.asset_pattern, spec, release.tag, host),
-            re.IGNORECASE,
-        )
-    except re.error as exc:
-        raise ConfigError(f"invalid asset_pattern for {spec.name}: {exc}") from exc
-    candidates = [asset for asset in release.assets if pattern.search(asset.name)]
-    if len(candidates) != 1:
+    if spec.asset_pattern is not None:
+        try:
+            pattern = re.compile(
+                expand_pattern(spec.asset_pattern, spec, release.tag, host),
+                re.IGNORECASE,
+            )
+        except re.error as exc:
+            raise ConfigError(f"invalid asset_pattern for {spec.name}: {exc}") from exc
+        candidates = [asset for asset in release.assets if pattern.search(asset.name)]
+        if len(candidates) != 1:
+            available = ", ".join(asset.name for asset in release.assets) or "none"
+            raise AssetError(
+                f"asset_pattern for {spec.name}@{release.tag} matched "
+                f"{len(candidates)} assets; expected exactly one; available: {available}"
+            )
+        return candidates[0]
+
+    scored = []
+    for asset in release.assets:
+        score = _score_asset(asset.name, host, spec.libc)
+        if score > 0:
+            scored.append((score, asset))
+    if not scored:
         available = ", ".join(asset.name for asset in release.assets) or "none"
         raise AssetError(
-            f"asset_pattern for {spec.name}@{release.tag} matched "
-            f"{len(candidates)} assets; expected exactly one; available: {available}"
+            f"no suitable asset found for {spec.name}@{release.tag} on {host.os}-{host.arch}; "
+            f"available: {available}"
         )
-    return candidates[0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score = scored[0][0]
+    best_candidates = [asset for score, asset in scored if score == best_score]
+    if len(best_candidates) > 1:
+        tars = [a for a in best_candidates if a.name.endswith((".tar.gz", ".tgz"))]
+        if len(tars) == 1:
+            return tars[0]
+        cand_names = ", ".join(a.name for a in best_candidates)
+        raise AssetError(
+            f"ambiguous matching assets for {spec.name} on {host.os}-{host.arch}: {cand_names}; "
+            "please specify asset_pattern in manifest"
+        )
+    return best_candidates[0]
 
 
 def _file_sha256(path: Path) -> str:
@@ -509,17 +970,20 @@ def _path(value: str | os.PathLike[str] | None, default: Path) -> Path:
 
 
 def default_bin_dir() -> Path:
-    return _path(os.environ.get("GHPM_BIN_DIR"), Path.home() / ".local" / "bin")
+    return _path(
+        os.environ.get("IMPURE_BIN_DIR") or os.environ.get("IMPURE_BIN_DIR"),
+        Path.home() / ".local" / "bin",
+    )
 
 
 def default_state_file() -> Path:
     root = os.environ.get("XDG_STATE_HOME")
-    default = (
-        Path(root) / "ghpm" / "state.json"
-        if root
-        else Path.home() / ".local" / "state" / "ghpm" / "state.json"
-    )
-    return _path(None, default)
+    base = Path(root) if root else Path.home() / ".local" / "state"
+    if (base / "impure" / "state.json").exists():
+        return (base / "impure" / "state.json").absolute()
+    if (base / "impure" / "state.json").exists():
+        return (base / "impure" / "state.json").absolute()
+    return _path(None, base / "impure" / "state.json")
 
 
 @dataclass(frozen=True)
@@ -598,7 +1062,7 @@ class PackageManager:
     def _write_state(self, state: Mapping[str, Any]) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(
-            prefix=".ghpm-state-", dir=self.state_file.parent
+            prefix=".impure-state-", dir=self.state_file.parent
         )
         temporary = Path(temporary_name)
         try:
@@ -651,7 +1115,8 @@ class PackageManager:
     ) -> None:
         digest = _asset_digest(asset)
         expected = digest
-        if spec.checksum_asset_pattern:
+        checksum_assets: list[ReleaseAsset] | None = None
+        if spec.checksum_asset_pattern is not None:
             try:
                 pattern = re.compile(
                     expand_pattern(
@@ -668,25 +1133,36 @@ class PackageManager:
                 for item in release.assets
                 if item.name != asset.name and pattern.search(item.name)
             ]
-            if len(candidates) > 1:
+            checksum_assets = candidates
+        elif spec.checksum_asset_suffix is not None:
+            checksum_name = asset.name + spec.checksum_asset_suffix
+            checksum_assets = [
+                item for item in release.assets if item.name == checksum_name
+            ]
+
+        if checksum_assets is not None:
+            if len(checksum_assets) > 1:
                 raise ChecksumError(
-                    f"checksum pattern matched {len(candidates)} assets; expected one"
+                    f"checksum source matched {len(checksum_assets)} assets; expected one"
                 )
-            if not candidates:
+            if not checksum_assets:
                 if spec.checksum_required:
-                    raise ChecksumError(
-                        f"checksum pattern matched no asset for {asset.name}"
-                    )
+                    if spec.checksum_asset_suffix is not None:
+                        detail = f"expected {asset.name + spec.checksum_asset_suffix}"
+                    else:
+                        detail = f"pattern matched no asset for {asset.name}"
+                    raise ChecksumError(f"checksum source {detail}")
             else:
-                checksum_path = temporary_dir / Path(candidates[0].name).name
-                self.client.download(candidates[0], checksum_path)
+                checksum_asset = checksum_assets[0]
+                checksum_path = temporary_dir / Path(checksum_asset.name).name
+                self.client.download(checksum_asset, checksum_path)
                 found = _checksum_text_value(
                     checksum_path.read_text(encoding="utf-8", errors="replace"),
                     asset.name,
                 )
                 if found is None and spec.checksum_required:
                     raise ChecksumError(
-                        f"checksum asset {candidates[0].name} has no SHA-256 hash "
+                        f"checksum asset {checksum_asset.name} has no SHA-256 hash "
                         f"for {asset.name}"
                     )
                 if found is not None:
@@ -720,29 +1196,30 @@ class PackageManager:
         environment = os.environ.copy()
         environment.update(
             {
-                "GHPM_ASSET": str(asset) if asset is not None else "",
-                "GHPM_OUTPUT_DIR": str(self.bin_dir),
-                "GHPM_VERSION": version,
-                "GHPM_OS": self.host.os,
-                "GHPM_ARCH": self.host.arch,
-                "GHPM_PACKAGE": spec.name,
-                "GHPM_REPO": spec.repo,
-                "GHPM_WORK_DIR": str(work_dir),
+                "IMPURE_ASSET": str(asset) if asset is not None else "",
+                "IMPURE_OUTPUT_DIR": str(self.bin_dir),
+                "IMPURE_VERSION": version,
+                "IMPURE_OS": self.host.os,
+                "IMPURE_ARCH": self.host.arch,
+                "IMPURE_LIBC": spec.libc,
+                "IMPURE_PACKAGE": spec.name,
+                "IMPURE_REPO": spec.repo,
+                "IMPURE_WORK_DIR": str(work_dir),
             }
         )
         try:
             result = subprocess.run(
-                ["bash", "-e", "-u", "-o", "pipefail", "-c", script, f"ghpm-{phase}"],
+                ["bash", "-e", "-u", "-o", "pipefail", "-c", script, f"impure-{phase}"],
                 cwd=work_dir,
                 env=environment,
                 check=False,
             )
         except FileNotFoundError as exc:
-            raise GhpmError("bash is required to run package scripts") from exc
+            raise ImpureError("bash is required to run package scripts") from exc
         except OSError as exc:
-            raise GhpmError(f"could not start {phase} script: {exc}") from exc
+            raise ImpureError(f"could not start {phase} script: {exc}") from exc
         if result.returncode != 0:
-            raise GhpmError(
+            raise ImpureError(
                 f"{phase} script for {spec.name} failed with exit code {result.returncode}"
             )
 
@@ -766,22 +1243,30 @@ class PackageManager:
             if dry_run:
                 return InstallResult(spec.name, release.tag, asset.name, True)
             if self.bin_dir.exists() and not self.bin_dir.is_dir():
-                raise GhpmError(f"installation path is not a directory: {self.bin_dir}")
-            with tempfile.TemporaryDirectory(prefix="ghpm-") as temporary_name:
+                raise ImpureError(f"installation path is not a directory: {self.bin_dir}")
+            with tempfile.TemporaryDirectory(prefix="impure-") as temporary_name:
                 temporary_dir = Path(temporary_name).resolve()
                 downloaded = temporary_dir / Path(asset.name).name
                 self.client.download(asset, downloaded)
                 self._verify(downloaded, release, asset, spec, temporary_dir)
                 self.bin_dir.parent.mkdir(parents=True, exist_ok=True)
                 self.bin_dir.mkdir(parents=True, exist_ok=True)
-                self._run_script(
-                    spec.install_script,
-                    phase="install",
-                    asset=downloaded,
-                    work_dir=temporary_dir,
-                    version=release.tag,
-                    spec=spec,
-                )
+                installed_files: list[str] = []
+                if spec.install_script is not None:
+                    self._run_script(
+                        spec.install_script,
+                        phase="install",
+                        asset=downloaded,
+                        work_dir=temporary_dir,
+                        version=release.tag,
+                        spec=spec,
+                    )
+                    installed_files = [spec.name]
+                else:
+                    installed_files = _extract_binaries(
+                        downloaded, self.bin_dir, spec.name
+                    )
+
                 record = {
                     "name": spec.name,
                     "repo": spec.repo,
@@ -789,7 +1274,8 @@ class PackageManager:
                     "resolved_version": release.tag,
                     "asset": asset.name,
                     "asset_digest": _asset_digest(asset),
-                    "script_installed": True,
+                    "installed_files": installed_files,
+                    "script_installed": bool(spec.install_script is not None),
                     "installed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                 }
                 state["packages"][spec.name] = record
@@ -823,7 +1309,7 @@ class PackageManager:
             state = self._read_state()
             record = state["packages"].get(name)
             if not isinstance(record, Mapping):
-                raise GhpmError(f"package is not installed: {name}")
+                raise ImpureError(f"package is not installed: {name}")
             raw_spec = record.get("spec")
             if not isinstance(raw_spec, Mapping):
                 raise StateError(
@@ -832,17 +1318,24 @@ class PackageManager:
             spec = PackageSpec.from_dict(raw_spec)
             if dry_run:
                 return RemoveResult(name, True)
-            with tempfile.TemporaryDirectory(
-                prefix=f"ghpm-{name}-uninstall-"
-            ) as temporary_name:
-                self._run_script(
-                    spec.uninstall_script,
-                    phase="uninstall",
-                    asset=None,
-                    work_dir=Path(temporary_name).resolve(),
-                    version=str(record.get("resolved_version", spec.version)),
-                    spec=spec,
-                )
+            if spec.uninstall_script is not None:
+                with tempfile.TemporaryDirectory(
+                    prefix=f"impure-{name}-uninstall-"
+                ) as temporary_name:
+                    self._run_script(
+                        spec.uninstall_script,
+                        phase="uninstall",
+                        asset=None,
+                        work_dir=Path(temporary_name).resolve(),
+                        version=str(record.get("resolved_version", spec.version)),
+                        spec=spec,
+                    )
+            else:
+                files_to_remove = record.get("installed_files") or [name]
+                for filename in files_to_remove:
+                    target = self.bin_dir / filename
+                    if target.is_symlink() or target.is_file():
+                        target.unlink(missing_ok=True)
             del state["packages"][name]
             self._write_state(state)
             return RemoveResult(name, True)
@@ -872,42 +1365,49 @@ class PackageManager:
         return results
 
 
-def parse_package_ref(value: str) -> tuple[str, str | None]:
+def parse_package_ref(value: str) -> tuple[str, str | None, str | None]:
     value = _string(value, "package reference")
-    if "@" not in value:
-        return _package_name(value), None
-    name, version = value.split("@", 1)
-    return _package_name(name), _string(version, "package version")
+    version = None
+    if "@" in value:
+        ref_part, version = value.split("@", 1)
+        version = _string(version, "package version")
+    else:
+        ref_part = value
+
+    if "/" in ref_part:
+        repo = _repo(ref_part)
+        raw_name = repo.split("/", 1)[1]
+        if raw_name.endswith(".git"):
+            raw_name = raw_name[:-4]
+        name = _package_name(raw_name)
+        return name, version, repo
+
+    return _package_name(ref_part), version, None
 
 
-MANIFEST_TEMPLATE = """# ghpm manifest
-# See `ghpm --help` for the complete schema.
+MANIFEST_TEMPLATE = """# impure config / manifest
+# See `impure --help` for the complete schema.
 
-version = 1
 bin_dir = "~/.local/bin"
+libc = "musl"                   # default Linux ABI: musl or gnu
 
-# Example package:
-#
+# 1. Packages list (Clean and simple array format)
+packages = [
+  # "BurntSushi/ripgrep",
+  # "sharkdp/bat",
+]
+
+# 2. Or classic named package tables:
 # [packages."ripgrep"]
 # repo = "BurntSushi/ripgrep"
 # version = "latest"
-# asset_pattern = '^ripgrep-{version}-{arch}.*(?:linux|darwin).*\\.tar\\.gz$'
-#
-# install_script = '''
-# set -euo pipefail
-# mkdir -p "$GHPM_OUTPUT_DIR"
-# tar -xzf "$GHPM_ASSET" -C "$GHPM_WORK_DIR"
-# install -m 0755 "$GHPM_WORK_DIR/rg" "$GHPM_OUTPUT_DIR/rg"
-# '''
-#
-# uninstall_script = '''
-# set -euo pipefail
-# rm -f -- "$GHPM_OUTPUT_DIR/rg"
-# '''
-#
-# [packages."ripgrep".checksum]
-# asset_pattern = '^SHA256SUMS$'
-# required = true
+
+# 3. Custom recipes (Optional: only needed if automatic extraction fails)
+# [recipes."direnv"]
+# repo = "direnv/direnv"
+# asset_pattern = '^direnv\\.{os}-{arch}$'
+# install_script = 'install -m 0755 "$IMPURE_ASSET" "$IMPURE_OUTPUT_DIR/direnv"'
+# uninstall_script = 'rm -f -- "$IMPURE_OUTPUT_DIR/direnv"'
 """
 
 
@@ -916,17 +1416,24 @@ Manifest TOML schema:
 
   version = 1                         required root integer
   bin_dir = "~/.local/bin"            optional root string
+  libc = "musl"                       optional default Linux ABI: musl or gnu
 
   [packages."NAME"]                  one table per package
   repo = "OWNER/REPOSITORY"           required GitHub repository
   version = "latest"                  optional; latest Release by default
-  asset_pattern = 'REGEX'             required; must match exactly one asset
-  install_script = '''...'''          required Bash script
-  uninstall_script = '''...'''        required Bash script
+  libc = "musl"                       optional package override; inherits root libc
+  asset_pattern = 'REGEX'             optional; heuristic auto-selection by default
+  install_script = '''...'''          optional; auto-extracts binaries by default
+  uninstall_script = '''...'''        optional; auto-removes binaries by default
 
   [packages."NAME".checksum]          optional SHA-256 checksum asset
   asset_pattern = 'REGEX'             checksum asset; at most one match
+  suffix = ".sha256"                  exact asset name suffix; alternative to pattern
   required = true                     fail if the checksum asset/hash is missing
+
+checksum.asset_pattern and checksum.suffix are mutually exclusive.
+With checksum.suffix, the checksum asset name is the selected package asset
+name followed by that suffix, for example "program.tar.gz.sha256".
 
 Package asset_pattern and checksum.asset_pattern support:
   {name}     package name
@@ -934,17 +1441,31 @@ Package asset_pattern and checksum.asset_pattern support:
   {version}  resolved tag with or without a leading "v"
   {os}       current OS aliases (darwin or linux)
   {arch}     current architecture aliases (aarch64 or amd64)
+  {libc}     current package ABI aliases (gnu/glibc or musl)
+  {platform} common release target identifiers for the current host and libc
+
+The root libc applies to every package that does not set its own libc. A
+package-level libc overrides the root value. The default is musl. The supported
+Linux target aliases are ABI-specific, so set libc = "gnu" for GNU assets;
+{platform} never combines GNU and musl aliases.
 
 The selected package asset is downloaded before install_script runs. The
-scripts run with bash -e -u -o pipefail in a temporary working directory:
-  GHPM_ASSET       downloaded package asset; empty during uninstall
-  GHPM_OUTPUT_DIR  configured install directory
-  GHPM_WORK_DIR    temporary working directory and current directory
-  GHPM_VERSION     resolved Release tag
-  GHPM_OS          darwin or linux
-  GHPM_ARCH        aarch64 or amd64
-  GHPM_PACKAGE     package name
-  GHPM_REPO        GitHub repository
+scripts run with bash -e -u -o pipefail:
+  IMPURE_ASSET       downloaded package asset; empty during uninstall
+  IMPURE_OUTPUT_DIR  configured install directory
+  IMPURE_WORK_DIR    temporary directory and initial cwd of the script
+  IMPURE_VERSION     resolved Release tag
+  IMPURE_OS          darwin or linux
+  IMPURE_ARCH        aarch64 or amd64
+  IMPURE_LIBC        selected package ABI: gnu or musl
+  IMPURE_PACKAGE     package name
+  IMPURE_REPO        GitHub repository
+
+For install, IMPURE_WORK_DIR contains IMPURE_ASSET. For uninstall, it is a new
+empty temporary directory. The script starts with cwd set to IMPURE_WORK_DIR;
+if the script later runs cd, its cwd changes but IMPURE_WORK_DIR does not.
+IMPURE_WORK_DIR is removed after the script exits, so persistent files belong in
+IMPURE_OUTPUT_DIR.
 
 Checksum assets should contain a SHA-256 entry for the selected package asset,
 such as "HASH  asset-name" or "SHA256 (asset-name) = HASH". A fixed digest is
@@ -953,34 +1474,36 @@ not part of the manifest schema.
 
 
 def _default_manifest() -> Path:
-    configured = os.environ.get("GHPM_MANIFEST")
+    configured = os.environ.get("IMPURE_MANIFEST") or os.environ.get("IMPURE_MANIFEST")
     if configured:
-        return _path(configured, Path.cwd() / "ghpm.toml")
-    local = Path.cwd() / "ghpm.toml"
-    if local.exists():
-        return local.absolute()
+        return _path(configured, Path.cwd() / "manifest.txt")
+    for name in ("manifest.txt", "packages.txt", "impure.toml", "impure.toml", "config.toml"):
+        local = Path.cwd() / name
+        if local.exists():
+            return local.absolute()
     root = os.environ.get("XDG_CONFIG_HOME")
-    return _path(
-        None,
-        Path(root) / "ghpm" / "manifest.toml"
-        if root
-        else Path.home() / ".config" / "ghpm" / "manifest.toml",
-    )
+    base = Path(root) if root else Path.home() / ".config"
+    for name in ("manifest.txt", "packages.txt", "manifest.toml", "config.toml"):
+        if (base / "impure" / name).exists():
+            return (base / "impure" / name).absolute()
+        if (base / "impure" / name).exists():
+            return (base / "impure" / name).absolute()
+    return _path(None, base / "impure" / "manifest.txt")
 
 
 def _default_init_manifest() -> Path:
-    configured = os.environ.get("GHPM_MANIFEST")
-    return _path(configured, Path.cwd() / "ghpm.toml")
+    configured = os.environ.get("IMPURE_MANIFEST") or os.environ.get("IMPURE_MANIFEST")
+    return _path(configured, Path.cwd() / "manifest.txt")
 
 
 def initialize_manifest(path: str | os.PathLike[str], *, force: bool = False) -> Path:
-    target = _path(path, Path.cwd() / "ghpm.toml")
+    target = _path(path, Path.cwd() / "impure.toml")
     if target.exists() and not force:
-        raise GhpmError(
+        raise ImpureError(
             f"manifest already exists: {target}; use --force to overwrite it"
         )
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=".ghpm-manifest-", dir=target.parent)
+    fd, temporary_name = tempfile.mkstemp(prefix=".impure-manifest-", dir=target.parent)
     temporary = Path(temporary_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -991,7 +1514,7 @@ def initialize_manifest(path: str | os.PathLike[str], *, force: bool = False) ->
         os.replace(temporary, target)
     except OSError as exc:
         temporary.unlink(missing_ok=True)
-        raise GhpmError(f"could not create manifest {target}: {exc}") from exc
+        raise ImpureError(f"could not create manifest {target}: {exc}") from exc
     return target
 
 
@@ -999,8 +1522,8 @@ def _load_manifest(path: Path | None, required: bool = True) -> Manifest | None:
     path = path or _default_manifest()
     if not path.exists():
         if required:
-            raise GhpmError(
-                f"manifest not found: {path}; pass --manifest or create ghpm.toml"
+            raise ImpureError(
+                f"manifest not found: {path}; pass --manifest or create manifest.txt"
             )
         return None
     return Manifest.load(path)
@@ -1008,13 +1531,20 @@ def _load_manifest(path: Path | None, required: bool = True) -> Manifest | None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="ghpm",
-        description="Install and maintain binaries distributed through GitHub Releases.",
+        prog="impure",
+        description="A blissfully impure package manager for GitHub Releases. "
+                    "Forget pure derivations; grab binaries with pure side effects.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=MANIFEST_SCHEMA_HELP,
     )
-    parser.add_argument("--version", action="version", version="ghpm 1.0")
-    parser.add_argument("--manifest", type=Path, help="manifest TOML path")
+    parser.add_argument("--version", action="version", version="impure 1.0")
+    parser.add_argument(
+        "--config",
+        "--manifest",
+        dest="manifest",
+        type=Path,
+        help="config/manifest TOML path",
+    )
     parser.add_argument(
         "--bin-dir", type=Path, help="installation directory (default: ~/.local/bin)"
     )
@@ -1023,7 +1553,7 @@ def _parser() -> argparse.ArgumentParser:
         "--api-url", default="https://api.github.com", help=argparse.SUPPRESS
     )
     parser.add_argument(
-        "--token", help="GitHub token; GHPM_TOKEN/GITHUB_TOKEN are also supported"
+        "--token", help="GitHub token; IMPURE_TOKEN/GITHUB_TOKEN are also supported"
     )
     parser.add_argument("--timeout", type=float, default=30.0, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -1046,12 +1576,12 @@ def _parser() -> argparse.ArgumentParser:
         nargs="?",
         type=Path,
         metavar="PATH",
-        help="manifest path (default: ./ghpm.toml)",
+        help="manifest path (default: ./manifest.txt)",
     )
     install = commands.add_parser(
-        "install", help="install packages declared in the manifest"
+        "install", help="install packages declared in the manifest or directly via owner/repo"
     )
-    install.add_argument("packages", nargs="+", metavar="PACKAGE[@VERSION]")
+    install.add_argument("packages", nargs="+", metavar="[OWNER/]PACKAGE[@VERSION]")
     update = commands.add_parser(
         "update", help="update selected or all installed packages"
     )
@@ -1101,14 +1631,25 @@ def _spec_for(
     manifest: Manifest | None,
     reference: str,
     installed: bool = True,
+    config: Config | None = None,
 ) -> PackageSpec:
-    name, version = parse_package_ref(reference)
+    name, version, repo = parse_package_ref(reference)
     spec = manifest.get(name) if manifest else None
     if spec is None and installed:
         spec = manager.installed_spec(name)
     if spec is None:
-        raise GhpmError(
-            f"package {name!r} is not declared in the manifest and is not installed"
+        cfg = config or Config.load()
+        spec = cfg.recipes.get(name)
+    if spec is None and repo is not None:
+        spec = PackageSpec(
+            name=name,
+            repo=repo,
+            version=version or "latest",
+        )
+        return spec
+    if spec is None:
+        raise ImpureError(
+            f"package {name!r} is not declared in the manifest, config recipes, and is not installed"
         )
     return spec.with_version(version) if version else spec
 
@@ -1121,9 +1662,9 @@ def _print_result(result: InstallResult) -> None:
 def _run(args: argparse.Namespace) -> int:
     if args.command == "init":
         if args.dry_run:
-            raise GhpmError("--dry-run cannot be used with init")
+            raise ImpureError("--dry-run cannot be used with init")
         if args.manifest is not None and args.manifest_path is not None:
-            raise GhpmError(
+            raise ImpureError(
                 "specify the manifest path either as init's argument or with --manifest"
             )
         target = args.manifest_path or args.manifest or _default_init_manifest()
@@ -1144,10 +1685,19 @@ def _run(args: argparse.Namespace) -> int:
                 print(f"{verb}: {result.name}")
         return 0
 
-    needs_manifest = args.command == "install" or (
-        args.command == "update" and bool(args.packages)
+    has_only_direct_repos = (
+        args.command == "install"
+        and bool(args.packages)
+        and all("/" in p.split("@", 1)[0] for p in args.packages)
     )
-    manifest = _load_manifest(args.manifest, needs_manifest)
+    needs_manifest = (
+        not has_only_direct_repos
+        and (
+            args.command == "install"
+            or (args.command == "update" and bool(args.packages))
+        )
+    )
+    manifest = _load_manifest(args.manifest, required=needs_manifest)
     manager = _manager(args, manifest)
     if args.command == "install":
         for reference in args.packages:
@@ -1197,17 +1747,17 @@ def _run(args: argparse.Namespace) -> int:
             else "installed: no"
         )
         return 0
-    raise GhpmError(f"unknown command: {args.command}")
+    raise ImpureError(f"unknown command: {args.command}")
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         return _run(_parser().parse_args(argv))
-    except GhpmError as exc:
-        print(f"ghpm: {exc}", file=sys.stderr)
+    except ImpureError as exc:
+        print(f"impure: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("ghpm: interrupted", file=sys.stderr)
+        print("impure: interrupted", file=sys.stderr)
         return 130
 
 
