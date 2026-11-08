@@ -11,12 +11,15 @@ import json
 import os
 import platform
 import re
+import runpy
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,7 +29,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-import tomllib
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib  # type: ignore
+    except ImportError:
+        tomllib = None
 
 try:
     import fcntl
@@ -234,14 +243,17 @@ class Config:
 
     @classmethod
     def default_path(cls) -> Path:
-        configured = os.environ.get("IMPURE_CONFIG") or os.environ.get("IMPURE_CONFIG")
+        configured = os.environ.get("IMPURE_CONFIG")
         if configured:
             return _path(configured, Path.cwd() / "config.toml")
         root = os.environ.get("XDG_CONFIG_HOME")
         impure_dir = Path(root) / "impure" if root else Path.home() / ".config" / "impure"
+        # Support config.py as well as config.toml
+        if (impure_dir / "config.py").exists():
+            return (impure_dir / "config.py").absolute()
         if (impure_dir / "config.toml").exists():
             return (impure_dir / "config.toml").absolute()
-        return _path(None, impure_dir / "config.toml")
+        return _path(None, impure_dir / "config.py")
 
     @classmethod
     def load(cls, path: str | os.PathLike[str] | None = None) -> Config:
@@ -250,11 +262,27 @@ class Config:
         ) if path is not None else cls.default_path()
         if not config_path.exists():
             return cls()
-        try:
-            with config_path.open("rb") as stream:
-                doc = tomllib.load(stream)
-        except Exception:
-            return cls()
+
+        doc: Mapping[str, Any] = {}
+        if config_path.suffix.lower() == ".py":
+            _Log.debug(f"loading Python config from {config_path}")
+            try:
+                doc = runpy.run_path(str(config_path))
+            except Exception as exc:
+                raise ConfigError(f"could not load config.py at {config_path}: {exc}") from exc
+        else:
+            _Log.debug(f"loading TOML config from {config_path}")
+            if tomllib is None:
+                raise ConfigError(
+                    f"reading TOML configuration ({config_path}) requires Python 3.11+ "
+                    "or the 'tomli' package. Consider using config.py instead."
+                )
+            try:
+                with config_path.open("rb") as stream:
+                    doc = tomllib.load(stream)
+            except Exception as exc:
+                raise ConfigError(f"invalid TOML in config {config_path}: {exc}") from exc
+
         if not isinstance(doc, Mapping):
             return cls()
         libc = _libc(doc.get("libc", "musl"))
@@ -294,6 +322,7 @@ class Manifest:
         cfg = config or Config.load()
 
         if manifest_path.suffix.lower() == ".txt":
+            _Log.debug(f"loading plain text manifest from {manifest_path}")
             try:
                 text_content = manifest_path.read_text(encoding="utf-8")
             except FileNotFoundError as exc:
@@ -334,6 +363,12 @@ class Manifest:
 
             return cls(packages=packages, bin_dir=cfg.bin_dir, libc=cfg.libc)
 
+        _Log.debug(f"loading TOML manifest from {manifest_path}")
+        if tomllib is None:
+            raise ConfigError(
+                f"reading TOML manifest ({manifest_path}) requires Python 3.11+ "
+                "or the 'tomli' package. Consider using a plain text manifest.txt instead."
+            )
         try:
             with manifest_path.open("rb") as stream:
                 document = tomllib.load(stream)
@@ -641,6 +676,113 @@ def _detect_github_token() -> str | None:
     return None
 
 
+class _Log:
+    """Lightweight logger controlled by verbosity level."""
+
+    verbosity: int = 0
+    quiet: bool = False
+
+    @classmethod
+    def info(cls, message: str) -> None:
+        if not cls.quiet and cls.verbosity >= 1:
+            print(f"info: {message}", file=sys.stderr)
+
+    @classmethod
+    def debug(cls, message: str) -> None:
+        if not cls.quiet and cls.verbosity >= 2:
+            print(f"debug: {message}", file=sys.stderr)
+
+    @classmethod
+    def trace(cls, message: str) -> None:
+        if not cls.quiet and cls.verbosity >= 3:
+            print(f"trace: {message}", file=sys.stderr)
+
+
+def _format_bytes(bytes_count: float) -> str:
+    """Format bytes count into human readable string."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    val = float(bytes_count)
+    unit_idx = 0
+    while val >= 1024.0 and unit_idx < len(units) - 1:
+        val /= 1024.0
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(val)} B"
+    return f"{val:.1f} {units[unit_idx]}"
+
+
+class _DownloadProgress:
+    """Terminal progress reporter for asset downloads."""
+
+    def __init__(self, filename: str, total_bytes: int | None, stream=None) -> None:
+        self.filename = filename
+        self.total_bytes = total_bytes
+        self.stream = stream or sys.stderr
+        self.isatty = hasattr(self.stream, "isatty") and self.stream.isatty()
+        self.downloaded = 0
+        self.start_time = time.monotonic()
+        self.last_update = 0.0
+
+    def update(self, chunk_len: int) -> None:
+        self.downloaded += chunk_len
+        now = time.monotonic()
+        # Update at most ~15 times per second or on completion
+        if now - self.last_update < 0.066:
+            return
+        self.last_update = now
+        self._render()
+
+    def _render(self) -> None:
+        if _Log.quiet or not self.isatty:
+            return
+        elapsed = max(time.monotonic() - self.start_time, 0.001)
+        speed = self.downloaded / elapsed
+        speed_str = f"{_format_bytes(speed)}/s"
+
+        terminal_cols = shutil.get_terminal_size((80, 20)).columns
+
+        if self.total_bytes and self.total_bytes > 0:
+            pct = min(self.downloaded / self.total_bytes, 1.0)
+            cur_str = _format_bytes(self.downloaded)
+            tot_str = _format_bytes(self.total_bytes)
+            # Prefix & suffix: "  foo.tar.gz [==>  ] 50% (10 MiB / 20 MiB, 2.1 MiB/s)"
+            stats = f" {pct * 100:5.1f}% ({cur_str} / {tot_str}, {speed_str})"
+            prefix = f"  {self.filename} "
+            avail = terminal_cols - len(prefix) - len(stats) - 2  # 2 for brackets '[' and ']'
+            bar_width = max(min(avail, 30), 5)
+            filled = int(bar_width * pct)
+            if filled > 0:
+                bar = "=" * (filled - 1) + (">" if filled < bar_width else "=")
+            else:
+                bar = ""
+            bar = bar.ljust(bar_width)
+            line = f"\r{prefix}[{bar}]{stats}"
+        else:
+            cur_str = _format_bytes(self.downloaded)
+            stats = f" ({cur_str}, {speed_str})"
+            line = f"\r  {self.filename}{stats}"
+
+        # Truncate if exceeds terminal columns, pad with space to clear previous line
+        if len(line) > terminal_cols:
+            line = line[:terminal_cols]
+        else:
+            line = line.ljust(terminal_cols)
+        self.stream.write(line)
+        self.stream.flush()
+
+    def finish(self) -> None:
+        if _Log.quiet:
+            return
+        if self.isatty:
+            self._render()
+            self.stream.write("\n")
+            self.stream.flush()
+        else:
+            size_str = _format_bytes(self.downloaded)
+            self.stream.write(f"Downloaded {self.filename} ({size_str})\n")
+            self.stream.flush()
+
+
 class GitHubClient:
     """Minimal GitHub Releases client with an injectable API base URL."""
 
@@ -660,6 +802,9 @@ class GitHubClient:
         headers = {"Accept": accept, "User-Agent": self.user_agent}
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"
+            _Log.debug(f"HTTP GET {url} [auth: token present]")
+        else:
+            _Log.debug(f"HTTP GET {url} [auth: none]")
         try:
             return urllib.request.urlopen(
                 urllib.request.Request(url, headers=headers), timeout=self.timeout
@@ -670,17 +815,21 @@ class GitHubClient:
             except OSError:
                 detail = ""
             suffix = f": {detail}" if detail else ""
+            _Log.debug(f"HTTP GET failed ({exc.code}) for {url}{suffix}")
             raise ReleaseError(
                 f"request failed ({exc.code}) for {url}{suffix}"
             ) from exc
         except urllib.error.URLError as exc:
+            _Log.debug(f"could not reach {url}: {exc.reason}")
             raise ReleaseError(f"could not reach {url}: {exc.reason}") from exc
         except TimeoutError as exc:
+            _Log.debug(f"request timed out for {url}")
             raise ReleaseError(f"request timed out: {url}") from exc
 
     def release(self, repo: str, version: str = "latest") -> Release:
         repo = _repo(repo)
         version = _string(version, "version")
+        _Log.info(f"fetching release metadata for {repo}@{version}")
         encoded_repo = urllib.parse.quote(repo, safe="/")
         if version.lower() == "latest":
             path = f"repos/{encoded_repo}/releases/latest"
@@ -708,7 +857,23 @@ class GitHubClient:
                 self._request(asset.url, "application/octet-stream") as response,
                 partial.open("wb") as output,
             ):
-                shutil.copyfileobj(response, output, 1024 * 1024)
+                content_length = response.headers.get("Content-Length")
+                total_bytes = None
+                if content_length and content_length.isdigit():
+                    total_bytes = int(content_length)
+                elif asset.size:
+                    total_bytes = asset.size
+
+                progress = _DownloadProgress(asset.name, total_bytes)
+                chunk_size = 64 * 1024
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    progress.update(len(chunk))
+                progress.finish()
+
             if not partial.is_file() or partial.stat().st_size == 0:
                 raise ReleaseError(f"downloaded asset is empty: {asset.name}")
             os.replace(partial, destination)
@@ -904,12 +1069,16 @@ def select_asset(
         except re.error as exc:
             raise ConfigError(f"invalid asset_pattern for {spec.name}: {exc}") from exc
         candidates = [asset for asset in release.assets if pattern.search(asset.name)]
+        _Log.debug(
+            f"pattern {pattern.pattern!r} matched {len(candidates)} of {len(release.assets)} assets"
+        )
         if len(candidates) != 1:
             available = ", ".join(asset.name for asset in release.assets) or "none"
             raise AssetError(
                 f"asset_pattern for {spec.name}@{release.tag} matched "
                 f"{len(candidates)} assets; expected exactly one; available: {available}"
             )
+        _Log.info(f"selected asset: {candidates[0].name}")
         return candidates[0]
 
     scored = []
@@ -917,6 +1086,7 @@ def select_asset(
         score = _score_asset(asset.name, host, spec.libc)
         if score > 0:
             scored.append((score, asset))
+            _Log.debug(f"candidate asset {asset.name} score={score}")
     if not scored:
         available = ", ".join(asset.name for asset in release.assets) or "none"
         raise AssetError(
@@ -929,12 +1099,14 @@ def select_asset(
     if len(best_candidates) > 1:
         tars = [a for a in best_candidates if a.name.endswith((".tar.gz", ".tgz"))]
         if len(tars) == 1:
+            _Log.info(f"selected asset (tar preference): {tars[0].name}")
             return tars[0]
         cand_names = ", ".join(a.name for a in best_candidates)
         raise AssetError(
             f"ambiguous matching assets for {spec.name} on {host.os}-{host.arch}: {cand_names}; "
             "please specify asset_pattern in manifest"
         )
+    _Log.info(f"selected asset: {best_candidates[0].name}")
     return best_candidates[0]
 
 
@@ -1176,12 +1348,14 @@ class PackageManager:
                 raise ChecksumError(
                     f"no SHA-256 checksum is available for {asset.name}"
                 )
+            _Log.debug(f"no checksum verification requested for {asset.name}")
             return
         actual = _file_sha256(downloaded)
         if actual != expected:
             raise ChecksumError(
                 f"SHA-256 mismatch for {asset.name}: expected {expected}, got {actual}"
             )
+        _Log.info(f"checksum verified: {actual}")
 
     def _run_script(
         self,
@@ -1194,24 +1368,33 @@ class PackageManager:
         spec: PackageSpec,
     ) -> None:
         environment = os.environ.copy()
-        environment.update(
-            {
-                "IMPURE_ASSET": str(asset) if asset is not None else "",
-                "IMPURE_OUTPUT_DIR": str(self.bin_dir),
-                "IMPURE_VERSION": version,
-                "IMPURE_OS": self.host.os,
-                "IMPURE_ARCH": self.host.arch,
-                "IMPURE_LIBC": spec.libc,
-                "IMPURE_PACKAGE": spec.name,
-                "IMPURE_REPO": spec.repo,
-                "IMPURE_WORK_DIR": str(work_dir),
-            }
-        )
+        script_vars = {
+            "IMPURE_ASSET": str(asset) if asset is not None else "",
+            "IMPURE_OUTPUT_DIR": str(self.bin_dir),
+            "IMPURE_VERSION": version,
+            "IMPURE_OS": self.host.os,
+            "IMPURE_ARCH": self.host.arch,
+            "IMPURE_LIBC": spec.libc,
+            "IMPURE_PACKAGE": spec.name,
+            "IMPURE_REPO": spec.repo,
+            "IMPURE_WORK_DIR": str(work_dir),
+        }
+        environment.update(script_vars)
+        _Log.info(f"running {phase}_script for {spec.name}...")
+        if _Log.verbosity >= 3:
+            _Log.trace(f"script environment variables: {script_vars}")
+            _Log.trace(f"script body:\n{script}")
         try:
+            # When verbosity >= 3, stream stdout/stderr directly to terminal
+            stdout = None if _Log.verbosity >= 3 else subprocess.PIPE
+            stderr = None if _Log.verbosity >= 3 else subprocess.PIPE
             result = subprocess.run(
                 ["bash", "-e", "-u", "-o", "pipefail", "-c", script, f"impure-{phase}"],
                 cwd=work_dir,
                 env=environment,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
                 check=False,
             )
         except FileNotFoundError as exc:
@@ -1219,9 +1402,12 @@ class PackageManager:
         except OSError as exc:
             raise ImpureError(f"could not start {phase} script: {exc}") from exc
         if result.returncode != 0:
-            raise ImpureError(
-                f"{phase} script for {spec.name} failed with exit code {result.returncode}"
-            )
+            err_msg = f"{phase} script for {spec.name} failed with exit code {result.returncode}"
+            if result.stderr:
+                err_msg += f"\n--- stderr ---\n{result.stderr.strip()}"
+            if result.stdout and _Log.verbosity >= 1:
+                err_msg += f"\n--- stdout ---\n{result.stdout.strip()}"
+            raise ImpureError(err_msg)
 
     def install(
         self,
@@ -1263,9 +1449,11 @@ class PackageManager:
                     )
                     installed_files = [spec.name]
                 else:
+                    _Log.info(f"extracting binaries to {self.bin_dir}...")
                     installed_files = _extract_binaries(
                         downloaded, self.bin_dir, spec.name
                     )
+                    _Log.debug(f"extracted files: {installed_files}")
 
                 record = {
                     "name": spec.name,
@@ -1518,7 +1706,9 @@ def initialize_manifest(path: str | os.PathLike[str], *, force: bool = False) ->
     return target
 
 
-def _load_manifest(path: Path | None, required: bool = True) -> Manifest | None:
+def _load_manifest(
+    path: Path | None, config: Config | None = None, required: bool = True
+) -> Manifest | None:
     path = path or _default_manifest()
     if not path.exists():
         if required:
@@ -1526,50 +1716,98 @@ def _load_manifest(path: Path | None, required: bool = True) -> Manifest | None:
                 f"manifest not found: {path}; pass --manifest or create manifest.txt"
             )
         return None
-    return Manifest.load(path)
+    return Manifest.load(path, config=config)
 
 
 def _parser() -> argparse.ArgumentParser:
+    # Common arguments that should be accepted both before and after subcommands
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config",
+        dest="config",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="global configuration path (default: ~/.config/impure/config.py or config.toml)",
+    )
+    common.add_argument(
+        "--manifest",
+        dest="manifest",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="package manifest path (default: ./manifest.txt)",
+    )
+    common.add_argument(
+        "--bin-dir",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="installation directory (default: ~/.local/bin)",
+    )
+    common.add_argument(
+        "--state-file",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="state JSON path",
+    )
+    common.add_argument(
+        "--api-url",
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    common.add_argument(
+        "--token",
+        default=argparse.SUPPRESS,
+        help="GitHub token; IMPURE_TOKEN/GITHUB_TOKEN are also supported",
+    )
+    common.add_argument(
+        "--timeout",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    common.add_argument(
+        "--force",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="force install scripts to run; overwrite an existing manifest with init",
+    )
+    common.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="resolve changes without writing files",
+    )
+    common.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=argparse.SUPPRESS,
+        help="increase verbosity level (-v: info, -vv: debug, -vvv: trace / script stream)",
+    )
+    common.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="suppress non-error output and progress bar",
+    )
+
     parser = argparse.ArgumentParser(
         prog="impure",
         description="A blissfully impure package manager for GitHub Releases. "
                     "Forget pure derivations; grab binaries with pure side effects.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=MANIFEST_SCHEMA_HELP,
+        parents=[common],
     )
     parser.add_argument("--version", action="version", version="impure 1.0")
-    parser.add_argument(
-        "--config",
-        "--manifest",
-        dest="manifest",
-        type=Path,
-        help="config/manifest TOML path",
-    )
-    parser.add_argument(
-        "--bin-dir", type=Path, help="installation directory (default: ~/.local/bin)"
-    )
-    parser.add_argument("--state-file", type=Path, help="state JSON path")
-    parser.add_argument(
-        "--api-url", default="https://api.github.com", help=argparse.SUPPRESS
-    )
-    parser.add_argument(
-        "--token", help="GitHub token; IMPURE_TOKEN/GITHUB_TOKEN are also supported"
-    )
-    parser.add_argument("--timeout", type=float, default=30.0, help=argparse.SUPPRESS)
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="force install scripts to run; overwrite an existing manifest with init",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="resolve changes without writing files"
-    )
+
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser(
         "init",
         help="create a commented manifest template",
         description="Create a new manifest template.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[common],
     )
     init.add_argument(
         "manifest_path",
@@ -1579,23 +1817,41 @@ def _parser() -> argparse.ArgumentParser:
         help="manifest path (default: ./manifest.txt)",
     )
     install = commands.add_parser(
-        "install", help="install packages declared in the manifest or directly via owner/repo"
+        "install",
+        help="install packages declared in the manifest or directly via owner/repo",
+        parents=[common],
     )
     install.add_argument("packages", nargs="+", metavar="[OWNER/]PACKAGE[@VERSION]")
     update = commands.add_parser(
-        "update", help="update selected or all installed packages"
+        "update",
+        help="update selected or all installed packages",
+        parents=[common],
     )
     update.add_argument("packages", nargs="*", metavar="PACKAGE[@VERSION]")
     remove = commands.add_parser(
-        "remove", aliases=["uninstall"], help="remove installed packages"
+        "remove",
+        aliases=["uninstall"],
+        help="remove installed packages",
+        parents=[common],
     )
     remove.add_argument("packages", nargs="+", metavar="PACKAGE")
-    commands.add_parser("list", aliases=["ls"], help="list installed packages")
+    commands.add_parser(
+        "list",
+        aliases=["ls"],
+        help="list installed packages",
+        parents=[common],
+    )
     info = commands.add_parser(
-        "info", help="show release and local package information"
+        "info",
+        help="show release and local package information",
+        parents=[common],
     )
     info.add_argument("package", metavar="PACKAGE[@VERSION]")
-    sync = commands.add_parser("sync", help="apply a declarative manifest")
+    sync = commands.add_parser(
+        "sync",
+        help="apply a declarative manifest",
+        parents=[common],
+    )
     sync.add_argument(
         "manifest_path",
         nargs="?",
@@ -1614,15 +1870,17 @@ def _parser() -> argparse.ArgumentParser:
 def _manager(
     args: argparse.Namespace, manifest: Manifest | None = None
 ) -> PackageManager:
-    bin_dir = (
-        args.bin_dir
-        if args.bin_dir is not None
-        else (manifest.bin_dir if manifest else None)
-    )
+    bin_dir = getattr(args, "bin_dir", None)
+    if bin_dir is None:
+        bin_dir = manifest.bin_dir if manifest else None
+    api_url = getattr(args, "api_url", "https://api.github.com")
+    token = getattr(args, "token", None)
+    timeout = getattr(args, "timeout", 30.0)
+    state_file = getattr(args, "state_file", None)
     return PackageManager(
         bin_dir=bin_dir,
-        state_file=args.state_file,
-        client=GitHubClient(args.api_url, args.token, args.timeout),
+        state_file=state_file,
+        client=GitHubClient(api_url, token, timeout),
     )
 
 
@@ -1660,28 +1918,36 @@ def _print_result(result: InstallResult) -> None:
 
 
 def _run(args: argparse.Namespace) -> int:
+    config_path = getattr(args, "config", None)
+    manifest_arg = getattr(args, "manifest", None)
+    force = getattr(args, "force", False)
+    dry_run = getattr(args, "dry_run", False)
+
+    cfg = Config.load(config_path)
     if args.command == "init":
-        if args.dry_run:
+        if dry_run:
             raise ImpureError("--dry-run cannot be used with init")
-        if args.manifest is not None and args.manifest_path is not None:
+        manifest_path = getattr(args, "manifest_path", None)
+        if manifest_arg is not None and manifest_path is not None:
             raise ImpureError(
                 "specify the manifest path either as init's argument or with --manifest"
             )
-        target = args.manifest_path or args.manifest or _default_init_manifest()
-        created = initialize_manifest(target, force=args.force)
+        target = manifest_path or manifest_arg or _default_init_manifest()
+        created = initialize_manifest(target, force=force)
         print(f"created manifest: {created}")
         return 0
     if args.command == "sync":
-        manifest = _load_manifest(args.manifest_path or args.manifest)
+        manifest_path = getattr(args, "manifest_path", None)
+        manifest = _load_manifest(manifest_path or manifest_arg, config=cfg)
         assert manifest is not None
         manager = _manager(args, manifest)
         for result in manager.sync(
-            manifest, prune=args.prune, force=args.force, dry_run=args.dry_run
+            manifest, prune=getattr(args, "prune", False), force=force, dry_run=dry_run
         ):
             if isinstance(result, InstallResult):
                 _print_result(result)
             else:
-                verb = "would remove" if args.dry_run else "removed"
+                verb = "would remove" if dry_run else "removed"
                 print(f"{verb}: {result.name}")
         return 0
 
@@ -1697,31 +1963,31 @@ def _run(args: argparse.Namespace) -> int:
             or (args.command == "update" and bool(args.packages))
         )
     )
-    manifest = _load_manifest(args.manifest, required=needs_manifest)
+    manifest = _load_manifest(manifest_arg, config=cfg, required=needs_manifest)
     manager = _manager(args, manifest)
     if args.command == "install":
         for reference in args.packages:
             _print_result(
                 manager.install(
-                    _spec_for(manager, manifest, reference, False),
-                    force=args.force,
-                    dry_run=args.dry_run,
+                    _spec_for(manager, manifest, reference, False, config=cfg),
+                    force=force,
+                    dry_run=dry_run,
                 )
             )
         return 0
     if args.command == "update":
         specs = (
-            [_spec_for(manager, manifest, reference) for reference in args.packages]
+            [_spec_for(manager, manifest, reference, config=cfg) for reference in args.packages]
             if args.packages
             else None
         )
-        for result in manager.update(specs, force=args.force, dry_run=args.dry_run):
+        for result in manager.update(specs, force=force, dry_run=dry_run):
             _print_result(result)
         return 0
     if args.command in {"remove", "uninstall"}:
         for name in args.packages:
-            result = manager.remove(name, dry_run=args.dry_run)
-            print(f"{'would remove' if args.dry_run else 'removed'} {result.name}")
+            result = manager.remove(name, dry_run=dry_run)
+            print(f"{'would remove' if dry_run else 'removed'} {result.name}")
         return 0
     if args.command in {"list", "ls"}:
         records = manager.installed()
@@ -1735,7 +2001,7 @@ def _run(args: argparse.Namespace) -> int:
                 )
         return 0
     if args.command == "info":
-        spec = _spec_for(manager, manifest, args.package)
+        spec = _spec_for(manager, manifest, args.package, config=cfg)
         release, asset, record = manager.inspect(spec)
         print(f"name: {spec.name}")
         print(f"repository: {spec.repo}")
@@ -1751,10 +2017,17 @@ def _run(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    parser = _parser()
+    args = parser.parse_args(argv)
+    _Log.verbosity = getattr(args, "verbose", 0)
+    _Log.quiet = getattr(args, "quiet", False)
     try:
-        return _run(_parser().parse_args(argv))
+        return _run(args)
     except ImpureError as exc:
-        print(f"impure: {exc}", file=sys.stderr)
+        if _Log.verbosity >= 2:
+            traceback.print_exc(file=sys.stderr)
+        else:
+            print(f"impure: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("impure: interrupted", file=sys.stderr)
